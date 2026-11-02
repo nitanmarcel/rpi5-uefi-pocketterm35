@@ -1,0 +1,160 @@
+diff --git a/Platform/RaspberryPi/Drivers/DwUsbHostDxe/DriverBinding.c b/Platform/RaspberryPi/Drivers/DwUsbHostDxe/DriverBinding.c
+index bb228e6..e6938e2 100644
+--- a/Platform/RaspberryPi/Drivers/DwUsbHostDxe/DriverBinding.c
++++ b/Platform/RaspberryPi/Drivers/DwUsbHostDxe/DriverBinding.c
+@@ -127,8 +127,17 @@ DriverStart (
+ 
+   Status = mFwProtocol->SetPowerState (RPI_MBOX_POWER_STATE_USB_HCD, TRUE, TRUE);
+   if (EFI_ERROR (Status)) {
++#ifdef DWC2_BCM2712
++    //
++    // On BCM2712 the legacy power-domain reply reads "off" for every device,
++    // also for running ones (vcmailbox GET_POWER_STATE 3 -> 0 under Linux),
++    // so RpiFirmwareDxe reports an error for a request that did nothing wrong.
++    //
++    DEBUG ((DEBUG_WARN, "USB power state reply ignored on BCM2712: %r\n", Status));
++#else
+     DEBUG ((DEBUG_ERROR, "Couldn't power on USB: %r\n", Status));
+     return Status;
++#endif
+   }
+ 
+   Status = CreateDwUsbHc (&DwHc);
+diff --git a/Platform/RaspberryPi/Drivers/DwUsbHostDxe/DwUsbHostDxe.c b/Platform/RaspberryPi/Drivers/DwUsbHostDxe/DwUsbHostDxe.c
+index 0cd833c..18bfd87 100644
+--- a/Platform/RaspberryPi/Drivers/DwUsbHostDxe/DwUsbHostDxe.c
++++ b/Platform/RaspberryPi/Drivers/DwUsbHostDxe/DwUsbHostDxe.c
+@@ -58,7 +58,7 @@ DwCoreInit (
+ EFI_STATUS
+ Wait4Bit (
+   IN  EFI_EVENT Timeout,
+-  IN  UINT32    Reg,
++  IN  UINTN     Reg,
+   IN  UINT32    Mask,
+   IN  BOOLEAN   Set
+   )
+@@ -1426,7 +1426,20 @@ DwCoreInit (
+   }
+ 
+   UsbCfg &= ~(DWC2_GUSBCFG_ULPI_UTMI_SEL | DWC2_GUSBCFG_PHYIF);
++#ifdef DWC2_BCM2712
++  //
++  // BCM2712: UTMI+ PHY (GHWCFG2 HS PHY type 1), so ULPI_UTMI_SEL stays 0, and
++  // the core must be forced into host mode, as Linux does with dr_mode=host
++  // (GUSBCFG 0x20001707 there): no external ULPI VBUS, turnaround 5, TOutCal 7.
++  //
++  UsbCfg &= ~(DWC2_GUSBCFG_ULPI_EXT_VBUS_DRV | DWC2_GUSBCFG_USBTRDTIM_MASK |
++              DWC2_GUSBCFG_TOUTCAL_MASK | DWC2_GUSBCFG_FORCEDEVMODE);
++  UsbCfg |= DWC2_GUSBCFG_FORCEHOSTMODE |
++            (5 << DWC2_GUSBCFG_USBTRDTIM_OFFSET) |
++            (7 << DWC2_GUSBCFG_TOUTCAL_OFFSET);
++#else
+   UsbCfg |= CONFIG_DWC2_PHY_TYPE << DWC2_GUSBCFG_ULPI_UTMI_SEL_OFFSET;
++#endif
+   UsbCfg &= ~DWC2_GUSBCFG_DDRSEL;
+ 
+   MmioWrite32 (DwHc->DwUsbBase + GUSBCFG, UsbCfg);
+@@ -1437,6 +1450,13 @@ DwCoreInit (
+     return Status;
+   }
+ 
++#ifdef DWC2_BCM2712
++  //
++  // A forced mode change takes up to 25 ms to settle.
++  //
++  MicroSecondDelay (50000);
++#endif
++
+   UsbCfg = MmioRead32 (DwHc->DwUsbBase + GUSBCFG);
+ 
+   UsbCfg &= ~(DWC2_GUSBCFG_ULPI_FSLS | DWC2_GUSBCFG_ULPI_CLK_SUS_M);
+@@ -1587,7 +1607,15 @@ CreateDwUsbHc (
+   DwHc->DwUsbOtgHc.ClearRootHubPortFeature        = DwHcClearRootHubPortFeature;
+   DwHc->DwUsbOtgHc.MajorRevision                  = 0x02;
+   DwHc->DwUsbOtgHc.MinorRevision                  = 0x00;
++#ifdef DWC2_BCM2712
++  //
++  // BCM2712 (Pi 5): the DWC2 OTG core behind the USB-C port sits on the AXI
++  // bus above 4 GB (Linux: /axi/usb@480000).
++  //
++  DwHc->DwUsbBase                                 = 0x1000480000ULL;
++#else
+   DwHc->DwUsbBase                                 = BCM2836_USB_BASE_ADDRESS;
++#endif
+ 
+   Pages = EFI_SIZE_TO_PAGES (DWC2_STATUS_BUF_SIZE);
+   DwHc->StatusBuffer = AllocatePages (Pages);
+diff --git a/Platform/RaspberryPi/Library/PlatformBootManagerLib/PlatformBm.c b/Platform/RaspberryPi/Library/PlatformBootManagerLib/PlatformBm.c
+index 323a236..8380a65 100644
+--- a/Platform/RaspberryPi/Library/PlatformBootManagerLib/PlatformBm.c
++++ b/Platform/RaspberryPi/Library/PlatformBootManagerLib/PlatformBm.c
+@@ -179,6 +179,29 @@ STATIC PLATFORM_USB_KEYBOARD mUsbKeyboard = {
+   }
+ };
+ 
++//
++// PocketTerm35 built-in keyboard: a CircuitPython RP2040 whose HID interface
++// is not a boot keyboard (subclass 0, protocol 0), so the entry above never
++// matches it. UsbKbDxe reads it in report protocol.
++//
++STATIC PLATFORM_USB_KEYBOARD mPocketTermKeyboard = {
++  {
++    {
++      MESSAGING_DEVICE_PATH, MSG_USB_CLASS_DP,
++      DP_NODE_LEN (USB_CLASS_DEVICE_PATH)
++    },
++    0x1209, // VendorId: pid.codes
++    0x0001, // ProductId
++    3,      // DeviceClass: HID
++    0,      // DeviceSubClass: none
++    0       // DeviceProtocol: none
++  },
++  {
++    END_DEVICE_PATH_TYPE, END_ENTIRE_DEVICE_PATH_SUBTYPE,
++    DP_NODE_LEN (EFI_DEVICE_PATH_PROTOCOL)
++  }
++};
++
+ STATIC EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *mSerialConProtocol;
+ 
+ /**
+@@ -634,6 +657,7 @@ PlatformBootManagerBeforeConsole (
+   // Add the hardcoded short-form USB keyboard device path to ConIn.
+   //
+   EfiBootManagerUpdateConsoleVariable (ConIn, (EFI_DEVICE_PATH_PROTOCOL*)&mUsbKeyboard, NULL);
++  EfiBootManagerUpdateConsoleVariable (ConIn, (EFI_DEVICE_PATH_PROTOCOL*)&mPocketTermKeyboard, NULL);
+ 
+   //
+   // Add the hardcoded serial console device path to ConIn, ConOut, ErrOut.
+diff --git a/Platform/RaspberryPi/RPi5/RPi5.dsc b/Platform/RaspberryPi/RPi5/RPi5.dsc
+index 61cdeff..3373b8f 100644
+--- a/Platform/RaspberryPi/RPi5/RPi5.dsc
++++ b/Platform/RaspberryPi/RPi5/RPi5.dsc
+@@ -635,6 +635,15 @@
+   # USB Support
+   #
+   MdeModulePkg/Bus/Pci/XhciDxe/XhciDxe.inf
++  # PocketTerm35: the keyboard sits on the USB-C DWC2 OTG core (host mode)
++  Platform/RaspberryPi/Drivers/DwUsbHostDxe/DwUsbHostDxe.inf {
++    <PcdsFixedAtBuild>
++      # the AXI bus maps DRAM 1:1 for this core (Linux /axi dma-ranges)
++      gEmbeddedTokenSpaceGuid.PcdDmaDeviceOffset|0x0
++      gEmbeddedTokenSpaceGuid.PcdDmaDeviceLimit|0xBFFFFFFF
++    <BuildOptions>
++      GCC:*_*_*_CC_FLAGS = -DDWC2_BCM2712
++  }
+   MdeModulePkg/Bus/Usb/UsbBusDxe/UsbBusDxe.inf
+   MdeModulePkg/Bus/Usb/UsbKbDxe/UsbKbDxe.inf
+   MdeModulePkg/Bus/Usb/UsbMassStorageDxe/UsbMassStorageDxe.inf
+diff --git a/Platform/RaspberryPi/RPi5/RPi5.fdf b/Platform/RaspberryPi/RPi5/RPi5.fdf
+index 19b169a..e7909a4 100644
+--- a/Platform/RaspberryPi/RPi5/RPi5.fdf
++++ b/Platform/RaspberryPi/RPi5/RPi5.fdf
+@@ -321,6 +321,7 @@ READ_LOCK_STATUS   = TRUE
+   # USB Support
+   #
+   INF MdeModulePkg/Bus/Pci/XhciDxe/XhciDxe.inf
++  INF Platform/RaspberryPi/Drivers/DwUsbHostDxe/DwUsbHostDxe.inf
+   INF MdeModulePkg/Bus/Usb/UsbBusDxe/UsbBusDxe.inf
+   INF MdeModulePkg/Bus/Usb/UsbKbDxe/UsbKbDxe.inf
+   INF MdeModulePkg/Bus/Usb/UsbMassStorageDxe/UsbMassStorageDxe.inf

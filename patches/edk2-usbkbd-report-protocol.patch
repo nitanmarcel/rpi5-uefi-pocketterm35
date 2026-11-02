@@ -1,0 +1,178 @@
+diff --git a/MdeModulePkg/Bus/Usb/UsbKbDxe/EfiKey.h b/MdeModulePkg/Bus/Usb/UsbKbDxe/EfiKey.h
+index 046e3b4..bf04eab 100644
+--- a/MdeModulePkg/Bus/Usb/UsbKbDxe/EfiKey.h
++++ b/MdeModulePkg/Bus/Usb/UsbKbDxe/EfiKey.h
+@@ -152,8 +152,22 @@ typedef struct {
+   USB_NS_KEY                           *CurrentNsKey;
+   EFI_KEY_DESCRIPTOR                   *KeyConvertionTable;
+   EFI_EVENT                            KeyboardLayoutEvent;
++  //
++  // Non-zero for a keyboard used in report protocol whose keyboard report
++  // carries this report ID in front of the 8-byte boot layout (PocketTerm35).
++  //
++  UINT8                                ReportId;
+ } USB_KB_DEV;
+ 
++//
++// PocketTerm35 keyboard: a CircuitPython RP2040 whose HID interface is not
++// boot-capable (subclass 0, protocol 0); its keyboard report is report ID 1
++// followed by the 8-byte boot layout, report IDs 2 and 3 are mouse and media.
++//
++#define POCKETTERM_KB_VID        0x1209
++#define POCKETTERM_KB_PID        0x0001
++#define POCKETTERM_KB_REPORT_ID  1
++
+ //
+ // Global Variables
+ //
+diff --git a/MdeModulePkg/Bus/Usb/UsbKbDxe/KeyBoard.c b/MdeModulePkg/Bus/Usb/UsbKbDxe/KeyBoard.c
+index aef1f8c..706cbe3 100644
+--- a/MdeModulePkg/Bus/Usb/UsbKbDxe/KeyBoard.c
++++ b/MdeModulePkg/Bus/Usb/UsbKbDxe/KeyBoard.c
+@@ -391,7 +391,39 @@ IsUSBKeyboard (
+     return TRUE;
+   }
+ 
+-  return FALSE;
++  return IsPocketTermKeyboard (UsbIo, &InterfaceDescriptor);
++}
++
++/**
++  Check for the PocketTerm35 keyboard, which only speaks report protocol.
++
++  @param  UsbIo                Pointer to a USB I/O protocol instance.
++  @param  InterfaceDescriptor  Its default interface descriptor.
++
++  @retval TRUE     The PocketTerm35 keyboard HID interface.
++  @retval FALSE    Something else.
++
++**/
++BOOLEAN
++IsPocketTermKeyboard (
++  IN  EFI_USB_IO_PROTOCOL           *UsbIo,
++  IN  EFI_USB_INTERFACE_DESCRIPTOR  *InterfaceDescriptor
++  )
++{
++  EFI_USB_DEVICE_DESCRIPTOR  DeviceDescriptor;
++
++  if ((InterfaceDescriptor->InterfaceClass != CLASS_HID) ||
++      (InterfaceDescriptor->InterfaceSubClass == SUBCLASS_BOOT))
++  {
++    return FALSE;
++  }
++
++  if (EFI_ERROR (UsbIo->UsbGetDeviceDescriptor (UsbIo, &DeviceDescriptor))) {
++    return FALSE;
++  }
++
++  return (BOOLEAN)((DeviceDescriptor.IdVendor == POCKETTERM_KB_VID) &&
++                   (DeviceDescriptor.IdProduct == POCKETTERM_KB_PID));
+ }
+ 
+ /**
+@@ -859,13 +891,19 @@ InitUSBKeyboard (
+ 
+   //
+   // Set boot protocol for the USB Keyboard.
+-  // This driver only supports boot protocol.
++  // This driver only supports boot protocol, except for the PocketTerm35
++  // keyboard, which has no boot interface and is read in report protocol.
+   //
+-  UsbSetProtocolRequest (
+-    UsbKeyboardDevice->UsbIo,
+-    UsbKeyboardDevice->InterfaceDescriptor.InterfaceNumber,
+-    BOOT_PROTOCOL
+-    );
++  if (IsPocketTermKeyboard (UsbKeyboardDevice->UsbIo, &UsbKeyboardDevice->InterfaceDescriptor)) {
++    UsbKeyboardDevice->ReportId = POCKETTERM_KB_REPORT_ID;
++  } else {
++    UsbKeyboardDevice->ReportId = 0;
++    UsbSetProtocolRequest (
++      UsbKeyboardDevice->UsbIo,
++      UsbKeyboardDevice->InterfaceDescriptor.InterfaceNumber,
++      BOOT_PROTOCOL
++      );
++  }
+ 
+   UsbKeyboardDevice->CtrlOn    = FALSE;
+   UsbKeyboardDevice->AltOn     = FALSE;
+@@ -1044,6 +1082,18 @@ KeyboardHandler (
+     return EFI_SUCCESS;
+   }
+ 
++  //
++  // Report protocol keyboard: keep only keyboard reports, minus the ID byte.
++  //
++  if (UsbKeyboardDevice->ReportId != 0) {
++    if (*(UINT8 *)Data != UsbKeyboardDevice->ReportId) {
++      return EFI_SUCCESS;
++    }
++
++    Data       = (UINT8 *)Data + 1;
++    DataLength = DataLength - 1;
++  }
++
+   //
+   // Following code checks current keyboard input report against old key code buffer.
+   // According to USB HID Firmware Specification, the report consists of 8 bytes.
+@@ -1866,6 +1916,7 @@ SetKeyLED (
+ {
+   LED_MAP  Led;
+   UINT8    ReportId;
++  UINT8    Buffer[2];
+ 
+   //
+   // Set each field in Led map.
+@@ -1875,7 +1926,24 @@ SetKeyLED (
+   Led.ScrollLock = (UINT8)((UsbKeyboardDevice->ScrollOn) ? 1 : 0);
+   Led.Resrvd     = 0;
+ 
+-  ReportId = 0;
++  ReportId = UsbKeyboardDevice->ReportId;
++  if (ReportId != 0) {
++    //
++    // With report IDs the report data starts with the ID.
++    //
++    Buffer[0] = ReportId;
++    CopyMem (&Buffer[1], &Led, 1);
++    UsbSetReportRequest (
++      UsbKeyboardDevice->UsbIo,
++      UsbKeyboardDevice->InterfaceDescriptor.InterfaceNumber,
++      ReportId,
++      HID_OUTPUT_REPORT,
++      2,
++      Buffer
++      );
++    return;
++  }
++
+   //
+   // Call Set_Report Request to lighten the LED.
+   //
+diff --git a/MdeModulePkg/Bus/Usb/UsbKbDxe/KeyBoard.h b/MdeModulePkg/Bus/Usb/UsbKbDxe/KeyBoard.h
+index 0c7d8b6..350af3a 100644
+--- a/MdeModulePkg/Bus/Usb/UsbKbDxe/KeyBoard.h
++++ b/MdeModulePkg/Bus/Usb/UsbKbDxe/KeyBoard.h
+@@ -57,6 +57,22 @@ IsUSBKeyboard (
+   IN  EFI_USB_IO_PROTOCOL  *UsbIo
+   );
+ 
++/**
++  Check for the PocketTerm35 keyboard, which only speaks report protocol.
++
++  @param  UsbIo                Pointer to a USB I/O protocol instance.
++  @param  InterfaceDescriptor  Its default interface descriptor.
++
++  @retval TRUE     The PocketTerm35 keyboard HID interface.
++  @retval FALSE    Something else.
++
++**/
++BOOLEAN
++IsPocketTermKeyboard (
++  IN  EFI_USB_IO_PROTOCOL           *UsbIo,
++  IN  EFI_USB_INTERFACE_DESCRIPTOR  *InterfaceDescriptor
++  );
++
+ /**
+   Initialize USB keyboard device and all private data structures.
+ 
